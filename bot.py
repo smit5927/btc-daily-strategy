@@ -1,3 +1,6 @@
+import sys
+print("PYTHON STARTED OK")
+sys.stdout.flush()
 print("BOT FILE RUNNING...")
 import os
 import time
