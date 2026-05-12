@@ -99,6 +99,17 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
+# =========================
+# SAFE REQUEST HELPERS
+# =========================
+
+def safe_json(r):
+    try:
+        return r.json()
+    except:
+        print("JSON ERROR: Response was not JSON:", r.text[:200])
+        sys.stdout.flush()
+        return None
 
 # =========================
 # API SIGNATURE HELPERS
@@ -136,7 +147,8 @@ def private_get(endpoint: str, params=None):
     }
 
     r = requests.get(url, headers=headers, timeout=20)
-    return r.json()
+    data = safe_json(r)
+    return data
 
 
 def private_post(endpoint: str, payload: dict):
@@ -157,7 +169,8 @@ def private_post(endpoint: str, payload: dict):
     }
 
     r = requests.post(url, headers=headers, data=body, timeout=20)
-    return r.json()
+    data = safe_json(r)
+    return data
 
 
 # =========================
@@ -167,10 +180,15 @@ def private_post(endpoint: str, payload: dict):
 def get_live_price():
     url = f"{BASE_URL}/v2/tickers/{PERP_SYMBOL}"
     r = requests.get(url, timeout=10)
-    data = r.json()
+    data = safe_json(r)
+
+    if not data:
+        return None
 
     if data.get("success") is not True:
-        raise Exception("Ticker API failed: " + str(data))
+        print("Ticker API failed:", data)
+        sys.stdout.flush()
+        return None
 
     return float(data["result"]["close"])
 
@@ -178,8 +196,13 @@ def get_live_price():
 def get_perp_position_size():
     data = private_get("/v2/positions/margined")
 
+    if not data:
+        return 0.0
+
     if data.get("success") is not True:
-        raise Exception("Positions API failed: " + str(data))
+        print("Positions API failed:", data)
+        sys.stdout.flush()
+        return 0.0
 
     for p in data.get("result", []):
         if p.get("product_symbol") == PERP_SYMBOL:
@@ -191,8 +214,13 @@ def get_perp_position_size():
 def get_last_buy_fill_price():
     data = private_get("/v2/fills", params={"page_size": 200})
 
+    if not data:
+        return None
+
     if data.get("success") is not True:
-        raise Exception("Fills API failed: " + str(data))
+        print("Fills API failed:", data)
+        sys.stdout.flush()
+        return None
 
     fills = data.get("result", [])
 
@@ -243,11 +271,9 @@ def safe_recover_batches(state_batches, exchange_pos_size, exchange_last_buy):
     if exchange_pos_size <= 0:
         return []
 
-    # if state already has batches, keep them
     if state_batches and len(state_batches) > 0:
         return state_batches
 
-    # fallback rebuild
     if exchange_last_buy is None:
         return []
 
@@ -277,7 +303,7 @@ def close_last_batch(state, live_price):
     sys.stdout.flush()
 
     resp = place_market_order(PERP_SYMBOL, "sell", size)
-    if resp.get("success") is not True:
+    if not resp or resp.get("success") is not True:
         print("FAILED TO SELL PERP. STOP.")
         sys.stdout.flush()
         return
@@ -286,7 +312,7 @@ def close_last_batch(state, live_price):
         print("BUYBACK HEDGE:", hedge_symbol, hedge_size)
         sys.stdout.flush()
         resp2 = place_market_order(hedge_symbol, "buy", hedge_size)
-        if resp2.get("success") is not True:
+        if not resp2 or resp2.get("success") is not True:
             print("FAILED TO BUYBACK HEDGE. MANUAL CHECK REQUIRED.")
             sys.stdout.flush()
 
@@ -316,12 +342,11 @@ def hedge_for_eligible_batches(state, live_price):
     sys.stdout.flush()
 
     resp = place_market_order(call_symbol, "sell", eligible_size)
-    if resp.get("success") is not True:
+    if not resp or resp.get("success") is not True:
         print("FAILED TO SELL HEDGE CALL.")
         sys.stdout.flush()
         return
 
-    # store hedge info in last batch (tracking only)
     state["batches"][-1]["hedge_symbol"] = call_symbol
     state["batches"][-1]["hedge_size"] = eligible_size
     save_state(state)
@@ -339,7 +364,7 @@ def add_new_buy_batch(state, live_price):
     sys.stdout.flush()
 
     resp = place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
-    if resp.get("success") is not True:
+    if not resp or resp.get("success") is not True:
         print("FAILED TO BUY PERP.")
         sys.stdout.flush()
         return
@@ -352,7 +377,7 @@ def add_new_buy_batch(state, live_price):
     sys.stdout.flush()
 
     resp2 = place_market_order(call_symbol, "sell", LOT_SIZE)
-    if resp2.get("success") is not True:
+    if not resp2 or resp2.get("success") is not True:
         print("FAILED TO SELL HEDGE CALL.")
         sys.stdout.flush()
         return
@@ -373,6 +398,11 @@ def add_new_buy_batch(state, live_price):
 def daily_execute(state):
     live_price = get_live_price()
     pos_size = get_perp_position_size()
+
+    if live_price is None:
+        print("LIVE PRICE NULL -> SKIP DAILY EXECUTE")
+        sys.stdout.flush()
+        return
 
     print("DAILY EXECUTION START -> LIVE:", live_price, "POS:", pos_size)
     sys.stdout.flush()
@@ -395,7 +425,6 @@ def daily_execute(state):
             print("INITIALIZED BATCH FROM EXCHANGE LAST BUY:", last_buy)
             sys.stdout.flush()
 
-    # LOOP: close batches if price >= last batch buy price
     while state["batches"]:
         last_price = float(state["batches"][-1]["buy_price"])
         if live_price >= last_price:
@@ -403,6 +432,8 @@ def daily_execute(state):
             sys.stdout.flush()
             close_last_batch(state, live_price)
             live_price = get_live_price()
+            if live_price is None:
+                break
         else:
             break
 
@@ -463,6 +494,16 @@ except Exception as e:
 try:
     while True:
         now_ist = datetime.now(IST)
+        live_price = get_live_price()
+        pos_size = get_perp_position_size()
+
+        # IMPORTANT: ALWAYS PRINT LIVE PRICE (Render log never stuck)
+        if live_price:
+            print(now_ist.strftime("%Y-%m-%d %H:%M:%S"), "LIVE PRICE:", live_price, "| POS:", pos_size)
+            sys.stdout.flush()
+        else:
+            print(now_ist.strftime("%Y-%m-%d %H:%M:%S"), "LIVE PRICE FETCH FAILED")
+            sys.stdout.flush()
 
         # execute exactly at 3:30 PM IST (1 time daily)
         if now_ist.hour == 15 and now_ist.minute == 30:
