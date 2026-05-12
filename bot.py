@@ -1,3 +1,4 @@
+print("BOT FILE RUNNING...")
 import os
 import time
 import json
