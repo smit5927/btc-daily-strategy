@@ -2,6 +2,7 @@ print("BOT FILE RUNNING...")
 import os
 import time
 import json
+import math
 import hmac
 import hashlib
 import requests
@@ -14,27 +15,24 @@ from datetime import datetime, timedelta, timezone
 
 BASE_URL = "https://api.india.delta.exchange"
 
-PERP_SYMBOL = os.getenv("PERP_SYMBOL", "ETHUSD")   # ETH perpetual
-UNDERLYING = os.getenv("UNDERLYING", "ETH")        # ETH for option format
+PERP_SYMBOL = "ETHUSD"
+UNDERLYING = "ETH"
 
-STRIKE_STEP = int(os.getenv("STRIKE_STEP", "20"))  # ETH option strike gap = 20
-LOT_SIZE = float(os.getenv("LOT_SIZE", "0.01"))    # Render env lot size
-CHECK_HOUR = int(os.getenv("CHECK_HOUR", "15"))    # 3:30 PM IST
-CHECK_MINUTE = int(os.getenv("CHECK_MINUTE", "30"))
+STRIKE_STEP = 20
+THRESHOLD = float(os.getenv("THRESHOLD", "0.005"))   # 0.5% default
+LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
 
-THRESHOLD = float(os.getenv("THRESHOLD", "0.005")) # 0.5%
+DELTA_API_KEY = os.getenv("DELTA_API_KEY")
+DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
+SLEEP_SECONDS = 15
 STATE_FILE = "state.json"
-
-API_KEY = os.getenv("DELTA_API_KEY")
-API_SECRET = os.getenv("DELTA_API_SECRET")
-
-USER_AGENT = "eth-daily-strategy-bot"
-
-SLEEP_SECONDS = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+USER_AGENT = "eth-daily-strategy-bot"
+
+print("BOT FILE RUNNING...")
 print("BOT STARTED...")
 print("PERP_SYMBOL:", PERP_SYMBOL)
 print("UNDERLYING:", UNDERLYING)
@@ -42,19 +40,46 @@ print("LOT_SIZE:", LOT_SIZE)
 print("STRIKE_STEP:", STRIKE_STEP)
 print("THRESHOLD:", THRESHOLD)
 
-if not API_KEY or not API_SECRET:
-    raise Exception("DELTA_API_KEY / DELTA_API_SECRET missing in Render Environment!")
+if not DELTA_API_KEY or not DELTA_API_SECRET:
+    raise Exception("Missing DELTA_API_KEY / DELTA_API_SECRET in environment!")
 
 # =========================
-# SIGNATURE HELPERS
+# STATE MANAGEMENT
+# =========================
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "batches": [],
+            "last_daily_run_date": None
+        }
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {
+            "batches": [],
+            "last_daily_run_date": None
+        }
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# =========================
+# API SIGNATURE HELPERS
 # =========================
 
 def generate_signature(message: str) -> str:
     return hmac.new(
-        API_SECRET.encode(),
+        DELTA_API_SECRET.encode(),
         message.encode(),
         hashlib.sha256
     ).hexdigest()
+
 
 def private_get(endpoint: str, params=None):
     if params is None:
@@ -73,14 +98,15 @@ def private_get(endpoint: str, params=None):
 
     headers = {
         "Accept": "application/json",
-        "api-key": API_KEY,
+        "api-key": DELTA_API_KEY,
         "timestamp": timestamp,
         "signature": signature,
         "User-Agent": USER_AGENT
     }
 
-    r = requests.get(url, headers=headers, timeout=15)
+    r = requests.get(url, headers=headers, timeout=20)
     return r.json()
+
 
 def private_post(endpoint: str, payload: dict):
     url = BASE_URL + endpoint
@@ -93,72 +119,67 @@ def private_post(endpoint: str, payload: dict):
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "api-key": API_KEY,
+        "api-key": DELTA_API_KEY,
         "timestamp": timestamp,
         "signature": signature,
         "User-Agent": USER_AGENT
     }
 
-    r = requests.post(url, headers=headers, data=body, timeout=15)
+    r = requests.post(url, headers=headers, data=body, timeout=20)
     return r.json()
 
+
 # =========================
-# MARKET DATA
+# MARKET HELPERS
 # =========================
 
-def get_live_price(symbol):
-    url = f"{BASE_URL}/v2/tickers/{symbol}"
-    r = requests.get(url, timeout=15)
+def get_live_price():
+    url = f"{BASE_URL}/v2/tickers/{PERP_SYMBOL}"
+    r = requests.get(url, timeout=10)
     data = r.json()
+
     if data.get("success") is not True:
-        raise Exception("Ticker failed: " + str(data))
+        raise Exception("Ticker API failed: " + str(data))
+
     return float(data["result"]["close"])
 
-# =========================
-# POSITIONS
-# =========================
 
-def get_open_positions():
+def get_perp_position_size():
     data = private_get("/v2/positions/margined")
+
     if data.get("success") is not True:
         raise Exception("Positions API failed: " + str(data))
-    return data.get("result", [])
 
-def get_position_size(symbol):
-    positions = get_open_positions()
-    for p in positions:
-        if p.get("product_symbol") == symbol:
+    for p in data.get("result", []):
+        if p.get("product_symbol") == PERP_SYMBOL:
             return float(p.get("size", 0))
+
     return 0.0
 
-def get_all_option_positions():
-    positions = get_open_positions()
-    opts = []
-    for p in positions:
-        sym = p.get("product_symbol", "")
-        if sym.startswith("C-") or sym.startswith("P-"):
-            if abs(float(p.get("size", 0))) > 0:
-                opts.append(p)
-    return opts
 
-# =========================
-# FILLS
-# =========================
+def get_last_buy_fill_price():
+    """
+    Return last BUY fill price for PERP_SYMBOL
+    """
+    data = private_get("/v2/fills", params={"page_size": 200})
 
-def get_last_fill_price(symbol):
-    data = private_get("/v2/fills", params={"page_size": 100})
     if data.get("success") is not True:
         raise Exception("Fills API failed: " + str(data))
 
     fills = data.get("result", [])
     for f in fills:
-        if f.get("product_symbol") == symbol:
+        if f.get("product_symbol") == PERP_SYMBOL and f.get("side") == "buy":
             return float(f.get("price"))
+
     return None
 
-# =========================
-# ORDER PLACEMENT
-# =========================
+
+def get_open_orders():
+    data = private_get("/v2/orders", params={"state": "open", "page_size": 200})
+    if data.get("success") is not True:
+        return []
+    return data.get("result", [])
+
 
 def place_market_order(symbol: str, side: str, size: float):
     payload = {
@@ -168,259 +189,275 @@ def place_market_order(symbol: str, side: str, size: float):
         "order_type": "market_order"
     }
     res = private_post("/v2/orders", payload)
-    print("ORDER:", side, symbol, size, "->", res)
+    print("ORDER RESPONSE:", res)
     return res
 
-# =========================
-# STATE FILE
-# =========================
-
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {
-            "batches": [],
-            "hedge_symbol": None,
-            "hedge_lots": 0,
-            "last_run_date": None
-        }
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
 
 # =========================
 # OPTION HELPERS
 # =========================
 
-def format_expiry_code(dt: datetime):
-    # Delta format example: 130526 (DDMMYY)
-    return dt.strftime("%d%m%y")
-
 def get_tomorrow_expiry_code():
-    now = datetime.now(IST)
-    tomorrow = now + timedelta(days=1)
-    return format_expiry_code(tomorrow)
+    now_ist = datetime.now(IST)
+    tomorrow = now_ist + timedelta(days=1)
+    return tomorrow.strftime("%d%m%y")
 
-def get_today_expiry_code():
-    now = datetime.now(IST)
-    return format_expiry_code(now)
 
-def round_to_atm_strike(price):
-    # nearest STRIKE_STEP
-    strike = round(price / STRIKE_STEP) * STRIKE_STEP
-    return int(strike)
+def get_atm_strike(price: float):
+    return int(round(price / STRIKE_STEP) * STRIKE_STEP)
 
-def build_call_symbol(strike, expiry_code):
-    # format: C-ETH-2320-130526
+
+def make_call_symbol(strike: int, expiry_code: str):
     return f"C-{UNDERLYING}-{strike}-{expiry_code}"
 
+
 # =========================
-# RECOVERY ON STARTUP
+# GOLD-LIKE SAFE VERIFY
 # =========================
 
-def recover_state_from_exchange(state):
-    print("RECOVERY STARTED...")
+def safe_recover_batches(state_batches, exchange_pos_size, exchange_last_buy):
+    """
+    If state empty but exchange position exists -> rebuild minimal batches.
+    """
+    if exchange_pos_size <= 0:
+        return []
 
-    perp_size = get_position_size(PERP_SYMBOL)
-    print("EXCHANGE PERP POSITION SIZE:", perp_size)
+    if state_batches and len(state_batches) > 0:
+        return state_batches
 
-    # if no batches but perp exists -> recover last fill as one batch
-    if perp_size > 0 and len(state["batches"]) == 0:
-        last_fill = get_last_fill_price(PERP_SYMBOL)
-        if last_fill:
-            lots = perp_size
-            state["batches"].append({
-                "price": last_fill,
-                "lots": lots
-            })
-            print("RECOVERED BATCH:", last_fill, lots)
+    # rebuild from last buy fill only (minimal safe)
+    if exchange_last_buy is None:
+        return []
 
-    # detect any existing CALL short
-    options = get_all_option_positions()
-    for op in options:
-        sym = op.get("product_symbol", "")
-        size = float(op.get("size", 0))
-        if sym.startswith("C-") and size < 0:
-            state["hedge_symbol"] = sym
-            state["hedge_lots"] = abs(size)
-            print("RECOVERED HEDGE:", sym, abs(size))
-            break
+    return [{
+        "buy_price": exchange_last_buy,
+        "size": exchange_pos_size,
+        "hedge_symbol": None,
+        "hedge_size": 0.0
+    }]
+
+
+# =========================
+# STRATEGY CORE LOGIC
+# =========================
+
+def close_last_batch(state, live_price):
+    """
+    Close last batch:
+    - Sell PERP (same size)
+    - Buyback hedge call (if exists)
+    """
+    if not state["batches"]:
+        return
+
+    last = state["batches"][-1]
+
+    size = float(last["size"])
+    hedge_symbol = last.get("hedge_symbol")
+    hedge_size = float(last.get("hedge_size", 0))
+
+    print("CLOSING LAST BATCH -> buy_price:", last["buy_price"], "size:", size)
+
+    # SELL PERP
+    resp = place_market_order(PERP_SYMBOL, "sell", size)
+    if resp.get("success") is not True:
+        print("FAILED TO SELL PERP")
+        return
+
+    # BUY BACK HEDGE
+    if hedge_symbol and hedge_size > 0:
+        print("BUYBACK HEDGE:", hedge_symbol, hedge_size)
+        resp2 = place_market_order(hedge_symbol, "buy", hedge_size)
+        if resp2.get("success") is not True:
+            print("FAILED TO BUYBACK HEDGE (MANUAL CHECK REQUIRED)")
+
+    # remove batch
+    state["batches"].pop()
+    save_state(state)
+    print("LAST BATCH CLOSED SUCCESSFULLY.")
+
+
+def hedge_for_active_batches(state, live_price):
+    """
+    Hedge rule:
+    Only hedge batches where buy_price <= live_price (price above their buy).
+    Total those lots and sell ATM call (tomorrow expiry) for that many lots.
+    """
+    expiry = get_tomorrow_expiry_code()
+    strike = get_atm_strike(live_price)
+    call_symbol = make_call_symbol(strike, expiry)
+
+    eligible_size = 0.0
+    for b in state["batches"]:
+        if live_price >= float(b["buy_price"]):
+            eligible_size += float(b["size"])
+
+    if eligible_size <= 0:
+        print("NO ELIGIBLE BATCHES FOR HEDGE SELL.")
+        return
+
+    print("HEDGE REQUIRED -> eligible lots:", eligible_size, "symbol:", call_symbol)
+
+    # SELL CALL OPTION
+    resp = place_market_order(call_symbol, "sell", eligible_size)
+    if resp.get("success") is not True:
+        print("FAILED TO SELL HEDGE CALL")
+        return
+
+    # mark hedge on LAST batch only (tracking purpose)
+    state["batches"][-1]["hedge_symbol"] = call_symbol
+    state["batches"][-1]["hedge_size"] = eligible_size
+    save_state(state)
+
+    print("HEDGE SOLD SUCCESSFULLY:", call_symbol, eligible_size)
+
+
+def add_new_buy_batch(state, live_price):
+    """
+    Add new buy batch:
+    - Buy PERP LOT_SIZE
+    - Sell ATM call tomorrow expiry for LOT_SIZE
+    """
+    expiry = get_tomorrow_expiry_code()
+    strike = get_atm_strike(live_price)
+    call_symbol = make_call_symbol(strike, expiry)
+
+    print("NEW BUY BATCH -> BUY PERP:", LOT_SIZE, "at price:", live_price)
+
+    resp = place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
+    if resp.get("success") is not True:
+        print("FAILED TO BUY PERP")
+        return
+
+    # use exchange last buy fill as true buy price
+    true_buy_price = get_last_buy_fill_price()
+    if true_buy_price is None:
+        true_buy_price = live_price
+
+    print("SELLING HEDGE CALL:", call_symbol, LOT_SIZE)
+
+    resp2 = place_market_order(call_symbol, "sell", LOT_SIZE)
+    if resp2.get("success") is not True:
+        print("FAILED TO SELL CALL HEDGE")
+        return
+
+    state["batches"].append({
+        "buy_price": true_buy_price,
+        "size": LOT_SIZE,
+        "hedge_symbol": call_symbol,
+        "hedge_size": LOT_SIZE
+    })
 
     save_state(state)
-    print("RECOVERY DONE.")
-    return state
+    print("NEW BATCH ADDED:", true_buy_price, LOT_SIZE)
 
-# =========================
-# STRATEGY LOGIC
-# =========================
 
-def close_hedge_if_expiring_today(state):
-    hedge_sym = state.get("hedge_symbol")
-    hedge_lots = float(state.get("hedge_lots", 0))
+def daily_execute(state):
+    """
+    Executes once per day at 3:30 PM IST.
+    """
+    live_price = get_live_price()
+    pos_size = get_perp_position_size()
 
-    if not hedge_sym or hedge_lots <= 0:
+    print("DAILY EXECUTION START -> LIVE:", live_price, "POS:", pos_size)
+
+    if pos_size <= 0:
+        print("NO POSITION FOUND. DAILY STRATEGY SKIPPED.")
         return
 
-    today_code = get_today_expiry_code()
+    # if no batches exist, initialize from last buy fill
+    if not state["batches"]:
+        last_buy = get_last_buy_fill_price()
+        if last_buy:
+            state["batches"].append({
+                "buy_price": last_buy,
+                "size": pos_size,
+                "hedge_symbol": None,
+                "hedge_size": 0.0
+            })
+            save_state(state)
+            print("INITIALIZED BATCH FROM EXCHANGE LAST BUY:", last_buy)
 
-    # hedge symbol ends with -DDMMYY
-    if hedge_sym.endswith(today_code):
-        print("HEDGE EXPIRING TODAY -> BUYBACK:", hedge_sym)
-        place_market_order(hedge_sym, "buy", hedge_lots)
-        state["hedge_symbol"] = None
-        state["hedge_lots"] = 0
-        save_state(state)
-
-def ensure_tomorrow_hedge(state, target_lots, live_price):
-    expiry_code = get_tomorrow_expiry_code()
-    strike = round_to_atm_strike(live_price)
-    call_sym = build_call_symbol(strike, expiry_code)
-
-    existing_sym = state.get("hedge_symbol")
-    existing_lots = float(state.get("hedge_lots", 0))
-
-    # If hedge already correct -> do nothing
-    if existing_sym == call_sym and abs(existing_lots - target_lots) < 1e-9:
-        print("HEDGE OK:", existing_sym, existing_lots)
-        return
-
-    # If hedge exists but wrong -> close old hedge first
-    if existing_sym and existing_lots > 0:
-        print("CLOSING OLD HEDGE:", existing_sym, existing_lots)
-        place_market_order(existing_sym, "buy", existing_lots)
-
-    # Sell new hedge
-    if target_lots > 0:
-        print("SELLING NEW HEDGE:", call_sym, target_lots)
-        place_market_order(call_sym, "sell", target_lots)
-
-        state["hedge_symbol"] = call_sym
-        state["hedge_lots"] = target_lots
-        save_state(state)
-
-def get_last_batch(state):
-    if len(state["batches"]) == 0:
-        return None
-    return state["batches"][-1]
-
-def pop_last_batch(state):
-    if len(state["batches"]) > 0:
-        return state["batches"].pop()
-    return None
-
-def strategy_run(state):
-    live_price = get_live_price(PERP_SYMBOL)
-    print("LIVE PRICE:", live_price)
-
-    # If no batches -> first buy
-    if len(state["batches"]) == 0:
-        print("NO BATCH FOUND -> FIRST BUY")
-        place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
-        state["batches"].append({"price": live_price, "lots": LOT_SIZE})
-        save_state(state)
-
-    # Step 1: If hedge expiring today -> close it
-    close_hedge_if_expiring_today(state)
-
-    # Step 2: Loop for price >= last batch price (close batch)
-    while True:
-        last_batch = get_last_batch(state)
-        if not last_batch:
-            break
-
-        last_price = float(last_batch["price"])
-        last_lots = float(last_batch["lots"])
-
-        live_price = get_live_price(PERP_SYMBOL)
-        print("CHECK BATCH:", last_price, "LIVE:", live_price)
+    # LOOP: close batches if price >= last batch buy price
+    while state["batches"]:
+        last_price = float(state["batches"][-1]["buy_price"])
 
         if live_price >= last_price:
-            print("PRICE >= LAST BATCH -> CLOSE LAST BATCH (SELL + BUYBACK CALL)")
-            # close hedge before closing batch
-            if state.get("hedge_symbol") and state.get("hedge_lots") > 0:
-                place_market_order(state["hedge_symbol"], "buy", state["hedge_lots"])
-                state["hedge_symbol"] = None
-                state["hedge_lots"] = 0
-
-            # close BTC/ETH batch
-            place_market_order(PERP_SYMBOL, "sell", last_lots)
-            pop_last_batch(state)
-            save_state(state)
-
-            # continue loop to check next last batch
+            print("PRICE ABOVE LAST BATCH -> closing...")
+            close_last_batch(state, live_price)
+            live_price = get_live_price()
             continue
-
         break
 
-    # Step 3: After closing possible batches, decide next action
-    last_batch = get_last_batch(state)
-    if not last_batch:
-        print("ALL BATCHES CLOSED -> KEEP 1 BASE POSITION")
-        place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
-        state["batches"].append({"price": live_price, "lots": LOT_SIZE})
-        save_state(state)
-        last_batch = get_last_batch(state)
+    if not state["batches"]:
+        print("ALL BATCHES CLOSED. STRATEGY END.")
+        return
 
-    last_price = float(last_batch["price"])
-    last_lots = float(last_batch["lots"])
-
-    live_price = get_live_price(PERP_SYMBOL)
-    down_trigger = last_price * (1 - THRESHOLD)
-
-    print("FINAL CHECK -> LAST:", last_price, "DOWN_TRIGGER:", down_trigger, "LIVE:", live_price)
+    # after closures, check last batch threshold
+    last_batch_price = float(state["batches"][-1]["buy_price"])
+    down_trigger = last_batch_price * (1 - THRESHOLD)
 
     if live_price <= down_trigger:
-        print("0.5% DOWN OR MORE -> NEW BUY + NEW TOMORROW HEDGE")
-        place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
-        state["batches"].append({"price": live_price, "lots": LOT_SIZE})
-        save_state(state)
-
-        # hedge only against new last batch lots
-        ensure_tomorrow_hedge(state, LOT_SIZE, live_price)
-
+        print("PRICE DOWN >= THRESHOLD -> NEW BUY + HEDGE")
+        add_new_buy_batch(state, live_price)
     else:
-        print("NO NEW BUY -> ONLY TOMORROW ATM HEDGE AGAINST LAST BATCH")
-        ensure_tomorrow_hedge(state, last_lots, live_price)
+        print("PRICE NOT DOWN ENOUGH -> ONLY HEDGE SELL REQUIRED")
+        hedge_for_active_batches(state, live_price)
 
-    return state
+    print("DAILY EXECUTION DONE.")
+
 
 # =========================
-# MAIN LOOP (Daily 3:30 PM IST)
+# STARTUP RECOVERY
 # =========================
 
 state = load_state()
-state = recover_state_from_exchange(state)
+print("RECOVERY STARTED...")
+
+try:
+    pos_size = get_perp_position_size()
+    last_buy = get_last_buy_fill_price()
+    live_price = get_live_price()
+
+    print("EXCHANGE PERP POSITION SIZE:", pos_size)
+    print("EXCHANGE LAST BUY FILL:", last_buy)
+
+    state["batches"] = safe_recover_batches(state.get("batches", []), pos_size, last_buy)
+    save_state(state)
+
+    print("RECOVERY DONE. BATCHES:", state["batches"])
+
+except Exception as e:
+    print("RECOVERY ERROR:", str(e))
+    traceback.print_exc()
+
+
+# =========================
+# MAIN LOOP
+# =========================
 
 while True:
     try:
-        now = datetime.now(IST)
-        today_str = now.strftime("%Y-%m-%d")
+        now_ist = datetime.now(IST)
 
-        if now.hour == CHECK_HOUR and now.minute == CHECK_MINUTE:
-            if state.get("last_run_date") != today_str:
-                print("===================================")
-                print("3:30 PM IST TRIGGER -> RUNNING STRATEGY")
-                print("===================================")
+        # 3:30 PM window
+        if now_ist.hour == 15 and now_ist.minute == 30:
+            today_str = now_ist.strftime("%Y-%m-%d")
 
-                state = load_state()  # reload latest state
-                state = recover_state_from_exchange(state)
-
-                state = strategy_run(state)
-
-                state["last_run_date"] = today_str
+            if state.get("last_daily_run_date") != today_str:
+                print("3:30 PM IST TRIGGERED. Running daily strategy...")
+                daily_execute(state)
+                state["last_daily_run_date"] = today_str
                 save_state(state)
-
-                print("STRATEGY COMPLETED FOR:", today_str)
-
             else:
-                print("ALREADY RAN TODAY:", today_str)
+                print("Already executed today. Waiting next day...")
 
-        time.sleep(SLEEP_SECONDS)
+            time.sleep(60)
+
+        else:
+            time.sleep(SLEEP_SECONDS)
 
     except Exception as e:
-        print("RUNTIME ERROR:", str(e))
+        print("MAIN LOOP ERROR:", str(e))
         traceback.print_exc()
-        time.sleep(10)
+        time.sleep(SLEEP_SECONDS)
