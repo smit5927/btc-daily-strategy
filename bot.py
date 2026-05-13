@@ -31,7 +31,7 @@ LOCK_FILE = "bot.lock"
 SLEEP_SECONDS = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
-USER_AGENT = "eth-daily-strategy-bot-final"
+USER_AGENT = "eth-daily-strategy-bot-GOLD-FINAL"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -48,7 +48,7 @@ if not DELTA_API_KEY or not DELTA_API_SECRET:
     raise Exception("Missing DELTA_API_KEY / DELTA_API_SECRET in environment!")
 
 # =========================
-# LOCK SYSTEM
+# LOCK SYSTEM (NO DUPLICATE RUN)
 # =========================
 
 def acquire_lock():
@@ -80,13 +80,19 @@ acquire_lock()
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"batches": [], "last_daily_run_date": None}
+        return {
+            "batches": [],
+            "last_daily_run_date": None
+        }
 
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"batches": [], "last_daily_run_date": None}
+        return {
+            "batches": [],
+            "last_daily_run_date": None
+        }
 
 
 def save_state(state):
@@ -95,7 +101,7 @@ def save_state(state):
 
 
 # =========================
-# SAFE REQUEST
+# SAFE JSON RESPONSE
 # =========================
 
 def safe_json_response(r):
@@ -277,7 +283,7 @@ def make_call_symbol(strike: int, expiry_code: str):
 
 
 # =========================
-# RECOVERY SYSTEM
+# RECOVERY (STATE + EXCHANGE VERIFY)
 # =========================
 
 def safe_recover_batches(state_batches, exchange_pos_size, exchange_last_buy, exchange_option_positions):
@@ -293,7 +299,7 @@ def safe_recover_batches(state_batches, exchange_pos_size, exchange_last_buy, ex
     hedge_symbol = None
     hedge_size = 0.0
 
-    # find any ETH call sell open
+    # find any open call sell (size < 0)
     for opt in exchange_option_positions:
         if opt["size"] < 0:
             hedge_symbol = opt["symbol"]
@@ -316,6 +322,8 @@ def close_today_expiry_calls():
     today_code = get_today_expiry_code()
     option_positions = get_option_positions()
 
+    any_closed = False
+
     for opt in option_positions:
         sym = opt["symbol"]
         size = opt["size"]
@@ -323,7 +331,15 @@ def close_today_expiry_calls():
         if today_code in sym and size < 0:
             print("TODAY EXPIRY CALL FOUND -> BUYBACK:", sym, abs(size))
             sys.stdout.flush()
-            place_market_order(sym, "buy", abs(size))
+
+            resp = place_market_order(sym, "buy", abs(size))
+            if resp.get("success") is True:
+                any_closed = True
+
+    if any_closed:
+        print("TODAY EXPIRY CALLS CLOSED SUCCESSFULLY.")
+    else:
+        print("NO TODAY EXPIRY CALL TO CLOSE.")
 
     print("TODAY EXPIRY CHECK DONE.")
     sys.stdout.flush()
@@ -348,10 +364,16 @@ def close_last_batch(state, live_price):
         sys.stdout.flush()
         return
 
+    # BUYBACK hedge if exists
     if hedge_symbol and hedge_size > 0:
         print("BUYBACK HEDGE:", hedge_symbol, hedge_size)
         sys.stdout.flush()
-        place_market_order(hedge_symbol, "buy", hedge_size)
+
+        resp2 = place_market_order(hedge_symbol, "buy", hedge_size)
+
+        if resp2.get("success") is not True:
+            print("HEDGE BUYBACK FAILED (MAYBE EXPIRED/INVALID). IGNORING.")
+            sys.stdout.flush()
 
     state["batches"].pop()
     save_state(state)
@@ -377,10 +399,26 @@ def hedge_for_eligible_batches(state, live_price):
         sys.stdout.flush()
         return
 
-    print("HEDGE SELL -> eligible lots:", eligible_size, "symbol:", call_symbol)
+    # check exchange option positions to avoid double sell
+    option_positions = get_option_positions()
+    already_sold = 0.0
+
+    for opt in option_positions:
+        if opt["symbol"] == call_symbol and opt["size"] < 0:
+            already_sold = abs(opt["size"])
+
+    remaining_to_sell = eligible_size - already_sold
+
+    if remaining_to_sell <= 0:
+        print("HEDGE ALREADY SOLD ENOUGH -> NO NEW SELL REQUIRED.")
+        sys.stdout.flush()
+        return
+
+    print("HEDGE SELL -> eligible:", eligible_size, "| already_sold:", already_sold, "| selling_now:", remaining_to_sell)
+    print("HEDGE SYMBOL:", call_symbol)
     sys.stdout.flush()
 
-    resp = place_market_order(call_symbol, "sell", eligible_size)
+    resp = place_market_order(call_symbol, "sell", remaining_to_sell)
     if resp.get("success") is not True:
         print("FAILED TO SELL HEDGE CALL.")
         sys.stdout.flush()
@@ -391,7 +429,7 @@ def hedge_for_eligible_batches(state, live_price):
     state["batches"][-1]["hedge_size"] = eligible_size
     save_state(state)
 
-    print("HEDGE SOLD SUCCESSFULLY:", call_symbol, eligible_size)
+    print("HEDGE SOLD SUCCESSFULLY:", call_symbol, remaining_to_sell)
     sys.stdout.flush()
 
 
@@ -407,7 +445,7 @@ def add_new_buy_batch(state, live_price):
     if resp.get("success") is not True:
         print("FAILED TO BUY PERP.")
         sys.stdout.flush()
-        return
+        return False
 
     true_buy_price = get_last_buy_fill_price()
     if true_buy_price is None:
@@ -420,7 +458,7 @@ def add_new_buy_batch(state, live_price):
     if resp2.get("success") is not True:
         print("FAILED TO SELL HEDGE CALL.")
         sys.stdout.flush()
-        return
+        return False
 
     state["batches"].append({
         "buy_price": true_buy_price,
@@ -433,6 +471,7 @@ def add_new_buy_batch(state, live_price):
 
     print("NEW BATCH ADDED -> buy_price:", true_buy_price, "size:", LOT_SIZE)
     sys.stdout.flush()
+    return True
 
 
 def daily_execute(state):
@@ -452,6 +491,7 @@ def daily_execute(state):
         sys.stdout.flush()
         return
 
+    # If state empty -> initialize from exchange
     if not state["batches"]:
         last_buy = get_last_buy_fill_price()
         if last_buy:
@@ -465,7 +505,7 @@ def daily_execute(state):
             print("INITIALIZED BATCH FROM EXCHANGE LAST BUY:", last_buy)
             sys.stdout.flush()
 
-    # LOOP CLOSE: if live price >= last batch buy price
+    # LOOP CLOSE MULTIPLE BATCHES (IMPORTANT LOGIC)
     while state["batches"]:
         last_price = float(state["batches"][-1]["buy_price"])
 
@@ -480,8 +520,19 @@ def daily_execute(state):
 
         break
 
+    # =========================
+    # FIXED MISSING RULE
+    # =========================
     if not state["batches"]:
-        print("ALL BATCHES CLOSED. END.")
+        print("ALL BATCHES CLOSED -> STARTING NEW CYCLE (BUY + TOMORROW HEDGE)")
+        sys.stdout.flush()
+
+        ok = add_new_buy_batch(state, live_price)
+
+        if ok:
+            print("NEW CYCLE STARTED SUCCESSFULLY.")
+        else:
+            print("FAILED TO START NEW CYCLE.")
         sys.stdout.flush()
         return
 
