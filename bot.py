@@ -31,7 +31,7 @@ LOCK_FILE = "bot.lock"
 SLEEP_SECONDS = 10
 
 IST = timezone(timedelta(hours=5, minutes=30))
-USER_AGENT = "eth-daily-strategy-bot-FULL-FINAL"
+USER_AGENT = "eth-daily-strategy-bot-FULL-FINAL-FIXED"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -214,7 +214,6 @@ def get_perp_position_size():
 
 def get_option_positions():
     positions = get_all_positions()
-
     option_positions = []
 
     for p in positions:
@@ -296,7 +295,6 @@ def safe_recover_batches(state_batches, exchange_pos_size, exchange_last_buy, ex
     hedge_symbol = None
     hedge_size = 0.0
 
-    # find any ETH call sell open
     for opt in exchange_option_positions:
         if opt["size"] < 0:
             hedge_symbol = opt["symbol"]
@@ -332,53 +330,6 @@ def close_today_expiry_calls():
     sys.stdout.flush()
 
 
-def close_last_batch(state, live_price):
-    if not state["batches"]:
-        return
-
-    last = state["batches"][-1]
-
-    size = float(last["size"])
-    hedge_symbol = last.get("hedge_symbol")
-    hedge_size = float(last.get("hedge_size", 0))
-
-    # SAFETY: never sell more than actual exchange position
-    exchange_pos = get_perp_position_size()
-    if exchange_pos <= 0:
-        print("NO PERP POSITION ON EXCHANGE -> cannot close batch.")
-        sys.stdout.flush()
-        return
-
-    if size > exchange_pos:
-        print("SAFETY ADJUST: batch size > exchange pos. Adjusting sell size to:", exchange_pos)
-        size = exchange_pos
-
-    print("CLOSING LAST BATCH -> buy_price:", last["buy_price"], "size:", size)
-    sys.stdout.flush()
-
-    resp = place_market_order(PERP_SYMBOL, "sell", size)
-    if resp.get("success") is not True:
-        print("FAILED TO SELL PERP. STOP.")
-        sys.stdout.flush()
-        return
-
-    # Hedge buyback (safe)
-    if hedge_symbol and hedge_size > 0:
-        print("BUYBACK HEDGE:", hedge_symbol, hedge_size)
-        sys.stdout.flush()
-
-        resp2 = place_market_order(hedge_symbol, "buy", hedge_size)
-        if resp2.get("success") is not True:
-            print("WARNING: Hedge buyback failed, maybe invalid contract:", hedge_symbol)
-            sys.stdout.flush()
-
-    state["batches"].pop()
-    save_state(state)
-
-    print("LAST BATCH CLOSED SUCCESSFULLY.")
-    sys.stdout.flush()
-
-
 def hedge_for_eligible_batches(state, live_price):
     expiry = get_tomorrow_expiry_code()
     strike = get_atm_strike(live_price)
@@ -386,7 +337,6 @@ def hedge_for_eligible_batches(state, live_price):
 
     eligible_size = 0.0
 
-    # Eligible means: buy_price <= live_price
     for b in state["batches"]:
         if live_price >= float(b["buy_price"]):
             eligible_size += float(b["size"])
@@ -396,7 +346,6 @@ def hedge_for_eligible_batches(state, live_price):
         sys.stdout.flush()
         return
 
-    # SAFETY: never sell hedge more than perp position size
     exchange_pos = get_perp_position_size()
     if eligible_size > exchange_pos:
         eligible_size = exchange_pos
@@ -415,7 +364,6 @@ def hedge_for_eligible_batches(state, live_price):
         sys.stdout.flush()
         return
 
-    # store hedge info only in last batch
     state["batches"][-1]["hedge_symbol"] = call_symbol
     state["batches"][-1]["hedge_size"] = eligible_size
     save_state(state)
@@ -465,18 +413,19 @@ def add_new_buy_batch(state, live_price):
 
 
 def ensure_reentry_if_all_closed(state, live_price):
-    """
-    IMPORTANT RULE:
-    If all batches got closed (position 0),
-    bot must re-enter by buying 1 LOT and selling tomorrow expiry call.
-    """
-
     pos_size = get_perp_position_size()
+    option_positions = get_option_positions()
 
     if pos_size > 0:
         return
 
-    print("RE-ENTRY RULE TRIGGERED -> No position found after closing. Re-entering...")
+    for opt in option_positions:
+        if opt["size"] < 0:
+            print("RE-ENTRY BLOCKED -> Hedge option still open:", opt)
+            sys.stdout.flush()
+            return
+
+    print("RE-ENTRY RULE TRIGGERED -> No position found. Re-entering...")
     sys.stdout.flush()
 
     expiry = get_tomorrow_expiry_code()
@@ -513,7 +462,6 @@ def ensure_reentry_if_all_closed(state, live_price):
 
 
 def daily_execute(state):
-    # Step 0: close today's expiry calls (mandatory)
     print("STEP-0: TODAY EXPIRY CLOSE CHECK START")
     sys.stdout.flush()
     close_today_expiry_calls()
@@ -529,7 +477,6 @@ def daily_execute(state):
         sys.stdout.flush()
         return
 
-    # If state empty, recover from exchange
     if not state["batches"]:
         last_buy = get_last_buy_fill_price()
         if last_buy:
@@ -543,27 +490,9 @@ def daily_execute(state):
             print("INITIALIZED BATCH FROM EXCHANGE LAST BUY:", last_buy)
             sys.stdout.flush()
 
-    # LOOP CLOSE: close multiple batches if price jumped above multiple buy levels
-    while state["batches"]:
-        last_price = float(state["batches"][-1]["buy_price"])
-
-        if live_price >= last_price:
-            print("PRICE ABOVE LAST BATCH -> closing batch...")
-            sys.stdout.flush()
-
-            close_last_batch(state, live_price)
-
-            live_price = get_live_price()
-            continue
-
-        break
-
-    # If all batches closed -> re-entry must happen
     if not state["batches"]:
-        print("ALL BATCHES CLOSED -> RE-ENTRY CHECK")
+        print("STATE STILL EMPTY -> SKIPPING.")
         sys.stdout.flush()
-
-        ensure_reentry_if_all_closed(state, live_price)
         return
 
     last_batch_price = float(state["batches"][-1]["buy_price"])
@@ -581,6 +510,8 @@ def daily_execute(state):
         print("PRICE NOT DOWN ENOUGH -> ONLY HEDGE SELL (eligible lots)")
         sys.stdout.flush()
         hedge_for_eligible_batches(state, live_price)
+
+    ensure_reentry_if_all_closed(state, live_price)
 
     print("DAILY EXECUTION DONE.")
     sys.stdout.flush()
@@ -638,7 +569,6 @@ try:
             print(now_ist.strftime("%Y-%m-%d %H:%M:%S"), "LIVE PRICE:", live_price, "| POS:", pos_size)
             sys.stdout.flush()
 
-            # execute exactly at 3:30 PM IST (1 time daily)
             if now_ist.hour == 15 and now_ist.minute == 30:
                 today_str = now_ist.strftime("%Y-%m-%d")
 
