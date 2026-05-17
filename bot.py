@@ -10,38 +10,45 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 # =========================
-# CONFIG
+# CONFIG (ENV SUPPORTED)
 # =========================
 
-BASE_URL = "https://api.india.delta.exchange"
+BASE_URL = os.getenv("BASE_URL", "https://api.india.delta.exchange")
 
-PERP_SYMBOL = "ETHUSD"
-UNDERLYING = "ETH"
+PERP_SYMBOL = os.getenv("PERP_SYMBOL", "ETHUSD")
+UNDERLYING = os.getenv("UNDERLYING", "ETH")
 
-STRIKE_STEP = 20
+STRIKE_STEP = int(os.getenv("STRIKE_STEP", "20"))
 THRESHOLD = float(os.getenv("THRESHOLD", "0.005"))  # 0.5%
+
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
+
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "10"))
+
+RUN_HOUR = int(os.getenv("RUN_HOUR", "15"))          # Default 3 PM
+RUN_MINUTE = int(os.getenv("RUN_MINUTE", "30"))      # Default 30 min
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
-STATE_FILE = "state.json"
-LOCK_FILE = "bot.lock"
-
-SLEEP_SECONDS = 10
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
+LOCK_FILE = os.getenv("LOCK_FILE", "bot.lock")
 
 IST = timezone(timedelta(hours=5, minutes=30))
-USER_AGENT = "eth-daily-strategy-bot-FULL-FINAL-FIXED"
+USER_AGENT = "eth-daily-strategy-bot-FINAL-NO-MAXBATCH"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
 
 print("BOT STARTED...")
+print("BASE_URL:", BASE_URL)
 print("PERP_SYMBOL:", PERP_SYMBOL)
 print("UNDERLYING:", UNDERLYING)
 print("LOT_SIZE:", LOT_SIZE)
 print("STRIKE_STEP:", STRIKE_STEP)
 print("THRESHOLD:", THRESHOLD)
+print("RUN_TIME:", f"{RUN_HOUR}:{RUN_MINUTE} IST")
+print("SLEEP_SECONDS:", SLEEP_SECONDS)
 sys.stdout.flush()
 
 if not DELTA_API_KEY or not DELTA_API_SECRET:
@@ -78,15 +85,27 @@ acquire_lock()
 # STATE MANAGEMENT
 # =========================
 
+def default_state():
+    return {
+        "batches": [],
+        "last_daily_run_date": None
+    }
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"batches": [], "last_daily_run_date": None}
+        return default_state()
 
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        d = default_state()
+        d.update(data)
+        return d
+
     except:
-        return {"batches": [], "last_daily_run_date": None}
+        return default_state()
 
 
 def save_state(state):
@@ -310,7 +329,7 @@ def safe_recover_batches(state_batches, exchange_pos_size, exchange_last_buy, ex
 
 
 # =========================
-# STRATEGY FUNCTIONS
+# STRATEGY CORE FUNCTIONS
 # =========================
 
 def close_today_expiry_calls():
@@ -330,61 +349,112 @@ def close_today_expiry_calls():
     sys.stdout.flush()
 
 
-def hedge_for_eligible_batches(state, live_price):
+def close_last_batch(state):
+    if not state["batches"]:
+        return False
+
+    last = state["batches"][-1]
+
+    batch_size = float(last["size"])
+    hedge_symbol = last.get("hedge_symbol")
+    hedge_size = float(last.get("hedge_size", 0))
+
+    exchange_pos = get_perp_position_size()
+
+    if exchange_pos <= 0:
+        print("NO EXCHANGE POSITION -> cannot close batch.")
+        sys.stdout.flush()
+        return False
+
+    sell_size = min(batch_size, exchange_pos)
+
+    if sell_size <= 0:
+        print("SELL BLOCKED -> sell_size 0 (NO SHORT).")
+        sys.stdout.flush()
+        return False
+
+    print("CLOSING LAST BATCH -> SELL PERP:", sell_size, "| BUY_PRICE:", last["buy_price"])
+    sys.stdout.flush()
+
+    resp = place_market_order(PERP_SYMBOL, "sell", sell_size)
+    if resp.get("success") is not True:
+        print("FAILED TO SELL PERP.")
+        sys.stdout.flush()
+        return False
+
+    if hedge_symbol and hedge_size > 0:
+        print("BUYBACK HEDGE:", hedge_symbol, hedge_size)
+        sys.stdout.flush()
+
+        resp2 = place_market_order(hedge_symbol, "buy", hedge_size)
+        if resp2.get("success") is not True:
+            print("WARNING: Hedge buyback failed:", hedge_symbol)
+            sys.stdout.flush()
+
+    state["batches"].pop()
+    save_state(state)
+
+    print("LAST BATCH CLOSED SUCCESSFULLY.")
+    sys.stdout.flush()
+    return True
+
+
+def sell_hedge_for_all_open_batches(state, live_price):
+    if not state["batches"]:
+        print("NO BATCHES -> hedge sell skipped.")
+        sys.stdout.flush()
+        return
+
     expiry = get_tomorrow_expiry_code()
     strike = get_atm_strike(live_price)
     call_symbol = make_call_symbol(strike, expiry)
 
-    eligible_size = 0.0
-
+    total_open_size = 0.0
     for b in state["batches"]:
-        if live_price >= float(b["buy_price"]):
-            eligible_size += float(b["size"])
-
-    if eligible_size <= 0:
-        print("NO ELIGIBLE BATCHES FOR HEDGE SELL.")
-        sys.stdout.flush()
-        return
+        total_open_size += float(b["size"])
 
     exchange_pos = get_perp_position_size()
-    if eligible_size > exchange_pos:
-        eligible_size = exchange_pos
+    total_open_size = min(total_open_size, exchange_pos)
 
-    if eligible_size <= 0:
-        print("NO ELIGIBLE SIZE AFTER SAFETY CHECK.")
+    if total_open_size <= 0:
+        print("NO HEDGE SIZE AVAILABLE.")
         sys.stdout.flush()
         return
 
-    print("HEDGE SELL -> eligible lots:", eligible_size, "symbol:", call_symbol)
+    print("SELLING HEDGE FOR ALL OPEN BATCHES:", call_symbol, "| SIZE:", total_open_size)
     sys.stdout.flush()
 
-    resp = place_market_order(call_symbol, "sell", eligible_size)
+    resp = place_market_order(call_symbol, "sell", total_open_size)
     if resp.get("success") is not True:
         print("FAILED TO SELL HEDGE CALL.")
         sys.stdout.flush()
         return
 
     state["batches"][-1]["hedge_symbol"] = call_symbol
-    state["batches"][-1]["hedge_size"] = eligible_size
+    state["batches"][-1]["hedge_size"] = total_open_size
     save_state(state)
 
-    print("HEDGE SOLD SUCCESSFULLY:", call_symbol, eligible_size)
+    print("HEDGE SOLD SUCCESSFULLY:", call_symbol, total_open_size)
     sys.stdout.flush()
 
 
 def add_new_buy_batch(state, live_price):
+    global LOT_SIZE
+
+    LOT_SIZE = float(os.getenv("LOT_SIZE", str(LOT_SIZE)))
+
     expiry = get_tomorrow_expiry_code()
     strike = get_atm_strike(live_price)
     call_symbol = make_call_symbol(strike, expiry)
 
-    print("NEW BUY BATCH -> BUY PERP:", LOT_SIZE, "live_price:", live_price)
+    print("NEW BUY BATCH -> BUY PERP:", LOT_SIZE, "AT PRICE:", live_price)
     sys.stdout.flush()
 
     resp = place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
     if resp.get("success") is not True:
         print("FAILED TO BUY PERP.")
         sys.stdout.flush()
-        return
+        return False
 
     true_buy_price = get_last_buy_fill_price()
     if true_buy_price is None:
@@ -397,7 +467,7 @@ def add_new_buy_batch(state, live_price):
     if resp2.get("success") is not True:
         print("FAILED TO SELL HEDGE CALL.")
         sys.stdout.flush()
-        return
+        return False
 
     state["batches"].append({
         "buy_price": true_buy_price,
@@ -408,8 +478,9 @@ def add_new_buy_batch(state, live_price):
 
     save_state(state)
 
-    print("NEW BATCH ADDED -> buy_price:", true_buy_price, "size:", LOT_SIZE)
+    print("NEW BATCH ADDED:", true_buy_price, LOT_SIZE)
     sys.stdout.flush()
+    return True
 
 
 def ensure_reentry_if_all_closed(state, live_price):
@@ -425,43 +496,21 @@ def ensure_reentry_if_all_closed(state, live_price):
             sys.stdout.flush()
             return
 
-    print("RE-ENTRY RULE TRIGGERED -> No position found. Re-entering...")
+    print("RE-ENTRY -> NO POSITION FOUND. ENTERING AGAIN...")
     sys.stdout.flush()
 
-    expiry = get_tomorrow_expiry_code()
-    strike = get_atm_strike(live_price)
-    call_symbol = make_call_symbol(strike, expiry)
+    add_new_buy_batch(state, live_price)
 
-    resp = place_market_order(PERP_SYMBOL, "buy", LOT_SIZE)
-    if resp.get("success") is not True:
-        print("RE-ENTRY BUY FAILED.")
-        sys.stdout.flush()
-        return
 
-    buy_price = get_last_buy_fill_price()
-    if buy_price is None:
-        buy_price = live_price
-
-    resp2 = place_market_order(call_symbol, "sell", LOT_SIZE)
-    if resp2.get("success") is not True:
-        print("RE-ENTRY HEDGE SELL FAILED.")
-        sys.stdout.flush()
-        return
-
-    state["batches"] = [{
-        "buy_price": buy_price,
-        "size": LOT_SIZE,
-        "hedge_symbol": call_symbol,
-        "hedge_size": LOT_SIZE
-    }]
-
-    save_state(state)
-
-    print("RE-ENTRY DONE -> Bought PERP and sold hedge:", call_symbol)
-    sys.stdout.flush()
-
+# =========================
+# DAILY EXECUTION (FULL LOGIC)
+# =========================
 
 def daily_execute(state):
+    global LOT_SIZE
+
+    LOT_SIZE = float(os.getenv("LOT_SIZE", str(LOT_SIZE)))
+
     print("STEP-0: TODAY EXPIRY CLOSE CHECK START")
     sys.stdout.flush()
     close_today_expiry_calls()
@@ -473,10 +522,12 @@ def daily_execute(state):
     sys.stdout.flush()
 
     if pos_size <= 0:
-        print("NO PERP POSITION FOUND. DAILY STRATEGY SKIPPED.")
+        print("NO PERP POSITION FOUND -> RE-ENTRY LOGIC.")
         sys.stdout.flush()
+        ensure_reentry_if_all_closed(state, live_price)
         return
 
+    # If state empty -> initialize from exchange
     if not state["batches"]:
         last_buy = get_last_buy_fill_price()
         if last_buy:
@@ -487,7 +538,7 @@ def daily_execute(state):
                 "hedge_size": 0.0
             })
             save_state(state)
-            print("INITIALIZED BATCH FROM EXCHANGE LAST BUY:", last_buy)
+            print("STATE INITIALIZED FROM EXCHANGE BUY:", last_buy)
             sys.stdout.flush()
 
     if not state["batches"]:
@@ -495,6 +546,36 @@ def daily_execute(state):
         sys.stdout.flush()
         return
 
+    # =========================
+    # STEP-1: CLOSE MULTIPLE BATCHES IF PRICE GAP UP
+    # =========================
+    while state["batches"]:
+        last_buy_price = float(state["batches"][-1]["buy_price"])
+        up_trigger = last_buy_price * (1 + THRESHOLD)
+
+        if live_price >= up_trigger:
+            print("PRICE UP >= 0.5% FROM LAST BUY -> CLOSE LAST BATCH")
+            sys.stdout.flush()
+
+            closed = close_last_batch(state)
+            if not closed:
+                break
+
+            live_price = get_live_price()
+            continue
+
+        break
+
+    # If all batches closed -> reentry
+    if not state["batches"]:
+        print("ALL BATCHES CLOSED -> RE-ENTRY REQUIRED")
+        sys.stdout.flush()
+        ensure_reentry_if_all_closed(state, live_price)
+        return
+
+    # =========================
+    # STEP-2: NOW DECIDE BUY OR ONLY HEDGE
+    # =========================
     last_batch_price = float(state["batches"][-1]["buy_price"])
     down_trigger = last_batch_price * (1 - THRESHOLD)
 
@@ -503,13 +584,14 @@ def daily_execute(state):
     sys.stdout.flush()
 
     if live_price <= down_trigger:
-        print("PRICE DOWN >= THRESHOLD -> NEW BUY + NEW HEDGE")
+        print("PRICE DOWN >= 0.5% -> NEW BUY + NEW HEDGE")
         sys.stdout.flush()
         add_new_buy_batch(state, live_price)
+
     else:
-        print("PRICE NOT DOWN ENOUGH -> ONLY HEDGE SELL (eligible lots)")
+        print("PRICE NOT DOWN ENOUGH -> ONLY SELL HEDGE FOR ALL OPEN LOTS")
         sys.stdout.flush()
-        hedge_for_eligible_batches(state, live_price)
+        sell_hedge_for_all_open_batches(state, live_price)
 
     ensure_reentry_if_all_closed(state, live_price)
 
@@ -566,14 +648,17 @@ try:
             live_price = get_live_price()
             pos_size = get_perp_position_size()
 
-            print(now_ist.strftime("%Y-%m-%d %H:%M:%S"), "LIVE PRICE:", live_price, "| POS:", pos_size)
+            print(now_ist.strftime("%Y-%m-%d %H:%M:%S"),
+                  "LIVE PRICE:", live_price,
+                  "| POS:", pos_size,
+                  "| BATCHES:", len(state.get("batches", [])))
             sys.stdout.flush()
 
-            if now_ist.hour == 15 and now_ist.minute == 30:
+            if now_ist.hour == RUN_HOUR and now_ist.minute == RUN_MINUTE:
                 today_str = now_ist.strftime("%Y-%m-%d")
 
                 if state.get("last_daily_run_date") != today_str:
-                    print("3:30 PM IST TRIGGERED -> Running daily strategy now...")
+                    print("DAILY TIME TRIGGERED -> Running strategy now...")
                     sys.stdout.flush()
 
                     daily_execute(state)
